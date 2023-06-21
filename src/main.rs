@@ -74,6 +74,7 @@ where
         if pending.is_some() {
             let mut fut = pending.unwrap();
             pin_mut!(fut);
+            // TODO - if Pending, retain inside pending again and return?
             let p = ready!(fut.poll_unpin(cx));
             Poll::Ready(Some(p))    
         } else {
