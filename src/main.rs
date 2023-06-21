@@ -1,6 +1,6 @@
-use std::{task::{Poll, Context}, pin::Pin};
-use futures::stream::{Stream,StreamExt};
-
+use std::{task::{Poll, Context, ready}, pin::{Pin, pin}};
+use futures::{stream::{Stream,StreamExt}, FutureExt, pin_mut, Future};
+use pin_project::*;
 // A simple source stream
 
 #[derive(Default)]
@@ -23,7 +23,7 @@ impl Stream for TestStream {
 }
 
 // some async transform function
-async fn my_transform(v: usize) -> usize {
+async fn my_async_transform(v: usize) -> usize {
     v * 100
 }
 
@@ -46,22 +46,55 @@ async fn my_transform(v: usize) -> usize {
 //
 //
 
-pub struct TransformedStream {
-    stream : Box<dyn Stream<Item=usize>> // This needs to be Pin<>
+#[pin_project]
+pub struct TransformedStream<Source,F>
+where 
+    Source : Stream, //<Item = Item>,
+    F : Future<Output = usize>
+{
+    #[pin]
+    // stream : dyn Stream<Item=usize> // This needs to be Pin<>
+    stream : Source, //dyn Stream<Item=usize>, // This needs to be Pin<>
+
+    #[pin]
+    pending : Option<F>,
 }
 
-impl Stream for TransformedStream {
+impl<Source,F> Stream for TransformedStream<Source,F> 
+where
+    Source : Stream<Item = usize> ,
+    F: Future<Output = usize>
+{
     type Item = usize;
 
     fn poll_next(self : Pin<&mut Self>, cx : &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.stream.poll_next(cx) {
-            Poll::Ready(Some(v)) => {
-                
-                let v = my_transform(v).await; // how to handle this
-                Poll::Ready(Some(v))
-            },
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+        let project = self.project();
+        let stream = project.stream;
+        let pending = project.pending;
+        if pending.is_some() {
+            let mut fut = pending.unwrap();
+            pin_mut!(fut);
+            let p = ready!(fut.poll_unpin(cx));
+            Poll::Ready(Some(p))    
+        } else {
+
+            match stream.poll_next(cx) {
+                Poll::Ready(Some(v)) => {
+                    let mut fut = my_async_transform(v);
+                    let mut fut = pin!(fut);
+
+                    match fut.poll(cx) {
+                        Poll::Ready(v) => Poll::Ready(Some(v)),
+                        Poll::Pending => {
+                            // not sure how to retain this in the self.pending
+                            project.pending = Pin::new(fut);
+                            Poll::Pending
+                        }
+                    }
+                },
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
         }
     }
 }
@@ -73,10 +106,14 @@ async fn main() {
 
     let streamA = TestStream::default();
 
+    // let sA : dyn Stream<Item=usize> = &mut streamA;
+    // let sA : dyn Stream<Item=usize> = streamA;
+
     let mut streamB = TransformedStream {
-        stream : Box::new(streamA)
+        stream : streamA
     };
 
+    pin_mut!(streamB);
     while let Some(item) = streamB.next().await {
         println!("{}", item);
     }
